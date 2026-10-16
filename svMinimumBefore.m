@@ -1,12 +1,15 @@
 function [minDB, wMin] = svMinimumBefore(w, Tgrid, Tfun, wLast)
-%SVMINIMUMBEFORE Minimum sorted singular values up to given frequencies.
+%SVMINIMUMBEFORE Deepest interior local minimum before each frequency limit.
 % w: positive increasing frequencies [rad/s].
 % Tgrid: ny-by-nu-by-numel(w) complex responses.
 % Tfun(wi): response matrix at one frequency, consistent with Tgrid.
-% wLast(k): inclusive upper frequency limit for singular value k.
-% Search starts at w(1). Nonfinite limits return NaN.
-% Local minima visible on the grid are refined in log frequency.
-% Narrow hidden minima may be missed. A zero minimum returns -Inf dB.
+% wLast(k): strict upper frequency limit for singular value k.
+% Searches w(1) < frequency < wLast(k), excluding both endpoints.
+% Only numerically resolved, strict local minima are accepted.
+% If none are found, or the limit is nonfinite, both outputs are NaN.
+% Candidate minima visible on the grid are refined in log frequency.
+% Hidden narrow minima and flat minimum intervals may be missed.
+% A zero minimum returns -Inf dB.
 %
 % Example:
 % [~,~,~,wLastMinus3] = svCrossings(w,Lgrid,Lfun,0);
@@ -50,26 +53,53 @@ function [minDB, wMin] = svMinimumBefore(w, Tgrid, Tfun, wLast)
         sk = [S(k, inside), svAt(log(upper), k, Tfun)];
         xk = log(wk);
 
-        [bestS, jBest] = min(sk);
-        bestW = wk(jBest);
-
+        % Endpoints bracket candidates but are never minimum candidates.
         idx = find( ...
             sk(2:end-1) <= sk(1:end-2) & ...
             sk(2:end-1) <= sk(3:end) & ...
            (sk(2:end-1) < sk(1:end-2) | ...
             sk(2:end-1) < sk(3:end))) + 1;
 
+        bestS = Inf;
+        bestW = NaN;
         f = @(x) svAt(x, k, Tfun);
+
         for j = idx
-            [xm, sm] = fminbnd(f, xk(j-1), xk(j+1), opts);
-            if sm < bestS
+            a = xk(j-1);
+            b = xk(j+1);
+            [xm, sm, exitflag] = fminbnd(f, a, b, opts);
+
+            % Reject a solver result that lies at a bracket boundary or
+            % fails to form a valley relative to both bracket endpoints.
+            if exitflag <= 0 || ~(a < xm && xm < b) || ...
+                    ~(sm < sk(j-1) && sm < sk(j+1))
+                continue
+            end
+
+            % Verify an actual local dip on both sides. No fixed frequency
+            % exclusion band: genuine dips close to wLast remain eligible.
+            h = min(1e-3*(b-a), 0.25*min(xm-a, b-xm));
+            if h <= 0 || xm-h == xm || xm+h == xm
+                continue
+            end
+            left = f(xm-h);
+            right = f(xm+h);
+            tolS = 32*eps(max([abs(sm), abs(left), abs(right)]));
+            if ~(left-sm > tolS && right-sm > tolS)
+                continue
+            end
+
+            wm = exp(xm);
+            if w(1) < wm && wm < upper && sm < bestS
                 bestS = sm;
-                bestW = min(wk(j+1), max(wk(j-1), exp(xm)));
+                bestW = wm;
             end
         end
 
-        minDB(k) = 20*log10(bestS);
-        wMin(k) = bestW;
+        if isfinite(bestW)
+            minDB(k) = 20*log10(bestS);
+            wMin(k) = bestW;
+        end
     end
 end
 
