@@ -1,109 +1,98 @@
 function [minDB, wMin] = svMinimumBefore(w, Tgrid, Tfun, wLast)
-%SVMINIMUMBEFORE Deepest interior local minimum before each frequency limit.
-% w: positive increasing frequencies [rad/s].
-% Tgrid: ny-by-nu-by-numel(w) complex responses.
-% Tfun(wi): response matrix at one frequency, consistent with Tgrid.
-% wLast(k): strict upper frequency limit for singular value k.
-% Searches w(1) < frequency < wLast(k), excluding both endpoints.
-% Only numerically resolved, strict local minima are accepted.
-% If none are found, or the limit is nonfinite, both outputs are NaN.
-% Candidate minima visible on the grid are refined in log frequency.
-% Hidden narrow minima and flat minimum intervals may be missed.
-% A zero minimum returns -Inf dB.
+% Her tekil deger icin w(1) < frekans < wLast(k) araligindaki
+% en derin YEREL cukuru bulur. Cukur yoksa iki cikti da NaN olur.
 %
-% Example:
-% [~,~,~,wLastMinus3] = svCrossings(w,Lgrid,Lfun,0);
-% [minDB,wMin] = svMinimumBefore(w,Tgrid,Tfun,wLastMinus3);
+% w      : Artan pozitif frekanslar [rad/s]
+% Tgrid  : Kompleks frekans cevaplari [ny x nu x numel(w)]
+% Tfun   : Tek frekansta T matrisini veren fonksiyon
+% wLast  : Her tekil degerin ust frekans siniri [rad/s]
+% minDB  : Secilen cukurun genligi [dB]
+% wMin   : Secilen cukurun frekansi [rad/s]
+%
+% Gridde gorunmeyen dar cukurlar ve duz minimum bolgeleri kacabilir.
+% Tgrid ve Tfun ayni sistemi temsil etmelidir.
 
     validateattributes(w, {'numeric'}, ...
         {'real', 'finite', 'positive', 'vector', 'nonempty'});
     validateattributes(wLast, {'numeric'}, {'real', 'vector'});
-    assert(isa(Tfun, 'function_handle'), 'Tfun must be a function handle.');
+    assert(isa(Tfun, 'function_handle'), 'Tfun fonksiyon olmali.');
+
     w = w(:).';
     wLast = wLast(:);
-
-    assert(all(diff(w) > 0), 'w must be strictly increasing.');
-    assert(size(Tgrid, 3) == numel(w), ...
-        'Tgrid and w sizes must agree.');
-    assert(all(isfinite(Tgrid(:))), 'Tgrid must contain finite values.');
-
     nSV = min(size(Tgrid, 1), size(Tgrid, 2));
-    assert(numel(wLast) == nSV, ...
-        'Provide one upper frequency limit per singular value.');
+    assert(all(diff(w) > 0), 'w kesin artan olmali.');
+    assert(size(Tgrid, 3) == numel(w), 'Tgrid ve w boyutlari uyusmuyor.');
+    assert(all(isfinite(Tgrid(:))), 'Tgrid sonlu degerler icermeli.');
+    assert(numel(wLast) == nSV, 'Her tekil deger icin bir sinir gerekli.');
 
-    S = zeros(nSV, numel(w));
+    % 1. Griddeki tekil degerleri bir kez hesapla.
+    sigma = zeros(nSV, numel(w));
     for j = 1:numel(w)
-        S(:, j) = svd(Tgrid(:, :, j));
+        sigma(:, j) = svd(Tgrid(:, :, j));
     end
 
     minDB = nan(nSV, 1);
     wMin = nan(nSV, 1);
-    opts = optimset('Display', 'off', 'TolX', 1e-10);
+    options = optimset('Display', 'off', 'TolX', 1e-10);
 
     for k = 1:nSV
-        upper = wLast(k);
-        if ~isfinite(upper)
+        limit = wLast(k);
+        if ~isfinite(limit)
             continue
         end
-        assert(upper >= w(1) && upper <= w(end), ...
-            'Upper frequency limit must lie within the grid range.');
+        assert(limit >= w(1) && limit <= w(end), ...
+            'Frekans siniri grid araliginda olmali.');
 
-        inside = w < upper;
-        wk = [w(inside), upper];
-        sk = [S(k, inside), svAt(log(upper), k, Tfun)];
-        xk = log(wk);
+        % 2. Araligi sinir frekansinda kes; yerel cukurlari belirle.
+        response = @(x) singularValue(Tfun, exp(x), k);
+        inside = w < limit;
+        x = log([w(inside), limit]);
+        y = [sigma(k, inside), response(log(limit))];
 
-        % Endpoints bracket candidates but are never minimum candidates.
-        idx = find( ...
-            sk(2:end-1) <= sk(1:end-2) & ...
-            sk(2:end-1) <= sk(3:end) & ...
-           (sk(2:end-1) < sk(1:end-2) | ...
-            sk(2:end-1) < sk(3:end))) + 1;
+        slope = diff(y);
+        dips = find(slope(1:end-1) <= 0 & slope(2:end) >= 0 & ...
+                   (slope(1:end-1) < 0 | slope(2:end) > 0)) + 1;
 
-        bestS = Inf;
-        bestW = NaN;
-        f = @(x) svAt(x, k, Tfun);
+        % 3. Cukurlari hassaslastir ve en derin olanini sec.
+        best = Inf;
+        for j = dips
+            [value, location] = refineDip(response, ...
+                x(j-1:j+1), y(j-1:j+1), options);
+            frequency = exp(location);
 
-        for j = idx
-            a = xk(j-1);
-            b = xk(j+1);
-            [xm, sm, exitflag] = fminbnd(f, a, b, opts);
-
-            % Reject a solver result that lies at a bracket boundary or
-            % fails to form a valley relative to both bracket endpoints.
-            if exitflag <= 0 || ~(a < xm && xm < b) || ...
-                    ~(sm < sk(j-1) && sm < sk(j+1))
-                continue
+            if value < best && frequency > w(1) && frequency < limit
+                best = value;
+                minDB(k) = 20*log10(value);
+                wMin(k) = frequency;
             end
-
-            % Verify an actual local dip on both sides. No fixed frequency
-            % exclusion band: genuine dips close to wLast remain eligible.
-            h = min(1e-3*(b-a), 0.25*min(xm-a, b-xm));
-            if h <= 0 || xm-h == xm || xm+h == xm
-                continue
-            end
-            left = f(xm-h);
-            right = f(xm+h);
-            tolS = 32*eps(max([abs(sm), abs(left), abs(right)]));
-            if ~(left-sm > tolS && right-sm > tolS)
-                continue
-            end
-
-            wm = exp(xm);
-            if w(1) < wm && wm < upper && sm < bestS
-                bestS = sm;
-                bestW = wm;
-            end
-        end
-
-        if isfinite(bestW)
-            minDB(k) = 20*log10(bestS);
-            wMin(k) = bestW;
         end
     end
 end
 
-function value = svAt(x, k, Tfun)
-    s = svd(Tfun(exp(x)));
-    value = s(k);
+function [value, location] = refineDip(response, x, y, options)
+% Sinira kayan veya iki yaninda yukselis olmayan sonucu ele.
+    [location, value, flag] = fminbnd(response, x(1), x(3), options);
+    if flag <= 0 || location <= x(1) || location >= x(3) || ...
+            value >= y(1) || value >= y(3)
+        value = Inf;
+        return
+    end
+
+    % Gercek yerel cukur kontrolu: iki yakin noktada genlik daha buyuk olmali.
+    step = min(1e-3*(x(3)-x(1)), ...
+               0.25*min(location-x(1), x(3)-location));
+    if step <= 0 || location-step == location || location+step == location
+        value = Inf;
+        return
+    end
+    neighbors = [response(location-step), response(location+step)];
+    tolerance = 32*eps(max(abs([value, neighbors])));
+    if ~all(neighbors-value > tolerance)
+        value = Inf;
+    end
+end
+
+function value = singularValue(Tfun, frequency, k)
+    values = svd(Tfun(frequency));
+    value = values(k);
 end
